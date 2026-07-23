@@ -205,7 +205,7 @@ def unload_light_models(classifier, clusterer, extractor):
 
 
 def load_qwen_verifier(model_path, sample_size, max_new_tokens, max_input_tokens,
-                        max_message_tokens):
+                        max_consecutive_oom_before_abort):
     
     print(f"\n[Main] Loading Qwen event verifier at {now_str()}...")
     print_resource_usage("Before loading Qwen verifier")
@@ -215,7 +215,7 @@ def load_qwen_verifier(model_path, sample_size, max_new_tokens, max_input_tokens
             sample_size=sample_size,
             max_new_tokens=max_new_tokens,
             max_input_tokens=max_input_tokens,
-            max_message_tokens=max_message_tokens
+            max_consecutive_oom_before_abort=max_consecutive_oom_before_abort
         )
         print_resource_usage("After loading Qwen verifier")
         return verifier
@@ -259,12 +259,14 @@ def main():
 
     QWEN_MODEL_PATH = "../../models/qwen/"
     QWEN_SAMPLE_SIZE = 20
-    QWEN_MAX_NEW_TOKENS = 512
-    QWEN_MAX_INPUT_TOKENS = 3072
-    # Per-message token cap fed into QwenEventVerifier - replaces the old
-    # OOM behavior of halving the cluster's message count (see
-    # event_verifier.py) with capping each individual message's length.
-    QWEN_MAX_MESSAGE_TOKENS = 300
+    QWEN_MAX_NEW_TOKENS = 256
+    QWEN_MAX_INPUT_TOKENS = 4600
+    # How many candidates in a row have to completely fail (exhaust their
+    # own retries with no valid JSON) before ev.py's verify_candidates
+    # gives up early on the rest of that day - see verify_candidates'
+    # docstring in ev.py. Matches ev.py's own default (5); listed here
+    # explicitly so it's one obvious place to tune without touching ev.py.
+    QWEN_MAX_CONSECUTIVE_OOM_BEFORE_ABORT = 5
 
     script_start = time.time()
     print(f"[Main] Script started at {now_str()}")
@@ -449,13 +451,33 @@ def main():
         # ---- Phase 4: LLM event verification - now runs right here, per day ----
         verifier = load_qwen_verifier(
             QWEN_MODEL_PATH, QWEN_SAMPLE_SIZE, QWEN_MAX_NEW_TOKENS, QWEN_MAX_INPUT_TOKENS,
-            QWEN_MAX_MESSAGE_TOKENS
+            QWEN_MAX_CONSECUTIVE_OOM_BEFORE_ABORT
         )
         phase4_start = time.time()
         day_verified_events = []
-        if day_candidates and verifier is not None:
+
+        # ev.py's verify_candidates reads candidate['cluster_id'] and
+        # candidate['messages'] directly (not .get(...)) - if
+        # CandidateExtractor ever changes its output schema, or a candidate
+        # is somehow missing messages, that would raise a KeyError partway
+        # through the day's candidates and (per the "don't touch ev.py"
+        # instruction) that's not something to patch inside ev.py itself.
+        # Normalizing here instead guarantees every candidate handed to it
+        # has what it needs, so phase 4 degrades gracefully (skips a
+        # malformed candidate) instead of raising and losing every already
+        # -verified candidate for the day.
+        verifiable_candidates = []
+        for i, cand in enumerate(day_candidates, 1):
+            if not cand.get('messages'):
+                print(f"[Main] WARNING: candidate #{i} for {j_date} has no messages - "
+                      f"skipping it in Phase 4.")
+                continue
+            cand.setdefault('cluster_id', f"{j_date}-{i}")
+            verifiable_candidates.append(cand)
+
+        if verifiable_candidates and verifier is not None:
             try:
-                day_verified_events = verifier.verify_candidates(day_candidates)
+                day_verified_events = verifier.verify_candidates(verifiable_candidates)
             except Exception as e:
                 print(f"[Main] ERROR during Phase 4 verification for {j_date} ({e}). "
                       f"Continuing with the next day.")
