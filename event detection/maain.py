@@ -17,6 +17,7 @@ from classifier import TookaClassifier, print_resource_usage
 from clustering import SocialMediaEpsilonClustering
 from candidate_extractor import CandidateExtractor
 from ev import QwenEventVerifier
+from data_writer import ClickHouseResultsWriter
 from utils import similarity_model
 from preprocessing import dynamic_preprocess, PreprocessingOptions  # not wired in yet - kept for a future phase
 
@@ -258,9 +259,9 @@ def main():
     CLUSTERING_MAX_BLOCK_BYTES = 512 * 1024 * 1024
 
     QWEN_MODEL_PATH = "../../models/qwen/"
-    QWEN_SAMPLE_SIZE = 20
-    QWEN_MAX_NEW_TOKENS = 256
-    QWEN_MAX_INPUT_TOKENS = 4600
+    QWEN_SAMPLE_SIZE = 10
+    QWEN_MAX_NEW_TOKENS = 512
+    QWEN_MAX_INPUT_TOKENS = 3072
     # How many candidates in a row have to completely fail (exhaust their
     # own retries with no valid JSON) before ev.py's verify_candidates
     # gives up early on the rest of that day - see verify_candidates'
@@ -272,6 +273,11 @@ def main():
     print(f"[Main] Script started at {now_str()}")
     print(f"[Main] USE_PRECOMPUTED_PHASE1 = {USE_PRECOMPUTED_PHASE1}")
     print_resource_usage("Startup - before loading anything")
+
+    # ---- ClickHouse writer for candidate_clusters / detected_events ----
+    # source=DB_NAME ("telegram") for now; if other platforms get added
+    # later, pass whichever table/platform name each run actually reads from.
+    results_writer = ClickHouseResultsWriter(db_name=DB_NAME, source=DB_NAME)
 
     report_files = ["report_phase2_clustering.txt", "report_phase3_candidates.txt",
                      "report_phase4_verified_events.csv"]
@@ -294,9 +300,10 @@ def main():
         df = loader.load_and_prepare(text_col='txtContent', date_col='date')
 
         print("\n[Main] Applying date range filter...")
-        mask_range1 = (df['date'] >= '2025-08-23') & (df['date'] <= '2025-08-24 23:59:59')
-        mask_range2 = (df['date'] > '2025-08-24') & (df['date'] <= '2025-08-25 23:59:59')
-        df = df[mask_range1 | mask_range2].copy()
+        mask_range1 = (df['date'] >= '2025-08-23') & (df['date'] < '2025-08-24 23:59:59')
+        # mask_range2 = (df['date'] > '2025-08-24') & (df['date'] <= '2025-08-25 23:59:59')
+        # df = df[mask_range1 | mask_range2].copy()
+        df = df[mask_range1].copy()
         print(f"[Main] Rows remaining after filter: {len(df)}")
 
         grouped_data = df.groupby(pd.Grouper(key='date', freq='1D'))
@@ -439,6 +446,7 @@ def main():
         day_candidates = extractor.process_daily_results([daily_full_data])
         all_final_candidates.extend(day_candidates)
         append_phase3_report_txt(day_candidates, j_date)
+        results_writer.save_candidate_clusters(day_candidates, execution_time=date)
         phase3_elapsed = time.time() - phase3_start
         print(f"[Main] Phase 3 (candidate extraction) done in {phase3_elapsed:.2f}s | "
               f"{len(day_candidates)} candidate(s)")
@@ -475,14 +483,20 @@ def main():
             cand.setdefault('cluster_id', f"{j_date}-{i}")
             verifiable_candidates.append(cand)
 
-        if verifiable_candidates and verifier is not None:
+        phase4_ran = bool(verifiable_candidates and verifier is not None)
+        if phase4_ran:
             try:
                 day_verified_events = verifier.verify_candidates(verifiable_candidates)
             except Exception as e:
                 print(f"[Main] ERROR during Phase 4 verification for {j_date} ({e}). "
                       f"Continuing with the next day.")
+                phase4_ran = False  # verification didn't actually complete - don't mark rejects
         all_verified_events.extend(day_verified_events)
         append_phase4_report_csv(day_verified_events, j_date)
+        results_writer.save_detected_events(
+            day_candidates, day_verified_events, execution_time=date,
+            verification_attempted=phase4_ran
+        )
 
         # ---- Release Qwen; the next day's iteration reloads the light models fresh ----
         verifier = unload_qwen_verifier(verifier)
@@ -531,6 +545,8 @@ def main():
 
     with open("db_verified_events_output.json", "w", encoding="utf-8") as f:
         json.dump(all_verified_events, f, ensure_ascii=False, indent=4, default=str)
+
+    results_writer.close()
 
     total_elapsed = time.time() - script_start
     print(f"\n[Main] Script finished successfully at {now_str()} - total time "
