@@ -1,64 +1,3 @@
-"""
-Writes Phase 3 (candidate clusters) and Phase 4 (verified events) results
-into ClickHouse, each into its own table via its own public method.
-
-Field-mapping notes (why each field is filled the way it is):
-
-  candidate_clusters.is_large      <- "Dominant"       in candidate['reasons']
-  candidate_clusters.has_burst     <- "Spike"           in candidate['reasons']
-  candidate_clusters.is_cohesive   <- "Cohesive_Large"  in candidate['reasons']
-    (these three strings are exactly what CandidateExtractor.process_daily_results
-    appends to `reasons` for rule1_dominant / rule2_spike / rule3_cohesive)
-
-  candidate_clusters.cluster_size  <- candidate['size']
-  candidate_clusters.sample_messages / detected_events.sample_messages
-    <- up to 10 of candidate['messages'] (same cap already used by the
-    phase3/phase4 .txt/.csv report writers in maain.py)
-
-  candidate_clusters.keywords / sentiment_polarity
-    Not produced anywhere upstream yet, so this module computes them with a
-    small dependency-free heuristic (word-frequency keywords, lexicon-based
-    polarity). These are placeholders - swap _extract_keywords /
-    _estimate_sentiment for a real model whenever one is wired in; nothing
-    else needs to change.
-
-  detected_events.cluster_id (UInt32, FK into candidate_clusters.id)
-    save_candidate_clusters() stamps the DB-assigned integer id back onto
-    each candidate dict as candidate['_db_id']. Because day_verified_events
-    (Phase 4's output) are the *same* dict objects as day_candidates (ev.py's
-    verify_candidates only filters/annotates them, never copies), that
-    '_db_id' is still there when save_detected_events() runs later the same
-    day - no separate id-mapping table needed. IMPORTANT: this means
-    save_candidate_clusters() must be called before save_detected_events()
-    for the same day, or cluster_id will be missing.
-
-  candidate_clusters.id / detected_events.id (UInt32)
-    ClickHouse has no autoincrement. Per your choice, the next id for each
-    table is fetched once (SELECT max(id)+1) the first time each method is
-    used in this run, then just incremented in Python for every following
-    row/day - not re-queried per day.
-
-  candidate_clusters.validation_status
-    Starts as 'pending' at Phase 3 insert time. save_detected_events()
-    updates it in place afterwards:
-      - 'confirmed' for every candidate that ended up in day_verified_events
-      - 'rejected'  for every OTHER candidate that Phase 4 actually
-                     evaluated (i.e. it had messages and verification ran)
-      - left as 'pending' (no UPDATE sent) for candidates Phase 4 never
-        touched at all - e.g. it had no messages, or the Qwen verifier
-        failed to load / crashed for the whole day. Marking those
-        'rejected' would misleadingly claim the model judged them false
-        when it never actually looked at them, so this module leaves
-        them alone instead. Pass verification_attempted=False from the
-        caller for a day where Phase 4 didn't run at all.
-      Caveat: if ev.py's own early-abort (max_consecutive_oom_before_abort)
-      cuts a day short, the still-untouched candidates after the abort
-      point are indistinguishable, from this module's side, from ones the
-      model genuinely rejected - ev.py doesn't return that distinction -
-      so those will get marked 'rejected' even though they were never
-      actually scored. This only matters on the (rare) days that trip the
-      abort.
-"""
 
 import os
 import re
@@ -186,7 +125,7 @@ class ClickHouseResultsWriter:
 
             rows.append([
                 assigned_id,
-                _text_field_or_empty(cand, 'keywords'),
+                ', '.join(cand.get('keywords', [])), 
                 1 if 'Dominant' in reasons else 0,
                 int(cand.get('size', 0) or 0),
                 1 if 'Spike' in reasons else 0,

@@ -11,12 +11,13 @@ import numpy as np
 import pandas as pd
 import jdatetime
 import torch
+import argparse
 
 from data_loader import DataLoader
 from classifier import TookaClassifier, print_resource_usage
 from clustering import SocialMediaEpsilonClustering
 from candidate_extractor import CandidateExtractor
-from ev import QwenEventVerifier
+from event_verifier import QwenEventVerifier
 from data_writer import ClickHouseResultsWriter
 from utils import similarity_model
 from preprocessing import dynamic_preprocess, PreprocessingOptions  # not wired in yet - kept for a future phase
@@ -142,7 +143,7 @@ def append_phase4_report_csv(day_verified_events, date_str, filename="report_pha
         if file_is_empty:
             writer.writerow([
                 "date_shamsi", "event_index", "cluster_size", "daily_ratio_pct",
-                "title", "summary", "sample_messages"
+                "title", "summary", "confidence", "sample_messages"
             ])
         for i, event in enumerate(day_verified_events, 1):
             messages = event.get('messages', [])
@@ -154,6 +155,7 @@ def append_phase4_report_csv(day_verified_events, date_str, filename="report_pha
                 i,
                 event.get('size', 'N/A'),
                 event.get('daily_ratio_pct', 'N/A'),
+                event.get('confidence', 'N/A'),
                 event.get('event_title', 'N/A'),
                 event.get('event_summary', 'N/A'),
                 sample_messages,
@@ -236,11 +238,52 @@ def unload_qwen_verifier(verifier):
     gc.collect()
     return None
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Day-by-day event prediction pipeline")
+
+    parser.add_argument("--db-name", default="telegram", help="ClickHouse database name")
+    parser.add_argument("--table-name",default="raya_sepehr_analytical", required=True, help="ClickHouse table name")
+    parser.add_argument("--text-col", default='txtContent',
+                         help="Name of the message-text column (default: DataLoader picks the "
+                              "right one automatically based on --db-name)")
+    parser.add_argument("--date-col", default='date',
+                         help="Name of the message post-date column (default: DataLoader picks "
+                              "'shdate' for Twitter/X or 'date' for Telegram)")
+
+    parser.add_argument("--start-date", required=True, help="Start date, inclusive (YYYY-MM-DD)")
+    parser.add_argument("--end-date", required=True, help="End date, exclusive (YYYY-MM-DD)")
+
+    parser.add_argument("--location-classifier-path", default="../../models/tooka_bert_classifer/tooka_fine_funed_1",
+                         help="Local path to the location NER model used by LocationExtractor")
+    
+    parser.add_argument("--source-name", default="telegram",
+                         help="Value stored in the 'source' column of every verified event "
+                              "(the social network the messages came from)")
+
+    parser.add_argument("--qwen-model-path", default="../../models/qwen/",
+                         help="Local path to the 4-bit Qwen model used by QwenEventVerifier "
+                              "to verify each cluster and produce title/summary")
+    parser.add_argument("--qwen-sample-size", type=int, default=10,
+                         help="How many messages to randomly sample from each cluster and "
+                              "send to the LLM for verification")
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=280,
+                         help="max_new_tokens passed to QwenEventVerifier")
+    parser.add_argument("--qwen-max-input-tokens", type=int, default=5000,
+                         help="max_input_tokens passed to QwenEventVerifier")
+    parser.add_argument("--skip-llm-verification", action="store_true",
+                         help="Skip Stage 5 (Qwen LLM verification) entirely - useful for "
+                              "debugging stages 1-4 without paying the cost of loading the LLM")
+
+    return parser.parse_args()
+
+
+
 
 def main():
-    DB_NAME = "telegram"
-    TABLE_NAME = "posts"
-    CLASSIFIER_PATH = "../../models/tooka_bert_classifer/tooka_fine_funed_1"
+    args = parse_args()
+    #DB_NAME = "telegram"
+    #TABLE_NAME = "posts"
+    #CLASSIFIER_PATH = "../../models/tooka_bert_classifer/tooka_fine_funed_1"
 
     # ---- Phase 1 skip switch ----
     # Classification is the slowest stage. If you already have
@@ -249,7 +292,7 @@ def main():
     # classifier model itself) is skipped entirely and its output is
     # parsed straight from that file instead. Set back to False to run
     # phase 1 for real (e.g. on new/different data).
-    USE_PRECOMPUTED_PHASE1 = True
+    USE_PRECOMPUTED_PHASE1 = False
     PHASE1_REPORT_PATH = "report_phase1_classification.txt"
 
     CLASSIFIER_BATCH_SIZE = 128
@@ -258,10 +301,10 @@ def main():
 
     CLUSTERING_MAX_BLOCK_BYTES = 512 * 1024 * 1024
 
-    QWEN_MODEL_PATH = "../../models/qwen/"
-    QWEN_SAMPLE_SIZE = 10
-    QWEN_MAX_NEW_TOKENS = 512
-    QWEN_MAX_INPUT_TOKENS = 3072
+    #QWEN_MODEL_PATH = "../../models/qwen/"
+    #QWEN_SAMPLE_SIZE = 10
+    #QWEN_MAX_NEW_TOKENS = 512
+    #QWEN_MAX_INPUT_TOKENS = 3072
     # How many candidates in a row have to completely fail (exhaust their
     # own retries with no valid JSON) before ev.py's verify_candidates
     # gives up early on the rest of that day - see verify_candidates'
@@ -271,20 +314,18 @@ def main():
 
     script_start = time.time()
     print(f"[Main] Script started at {now_str()}")
-    print(f"[Main] USE_PRECOMPUTED_PHASE1 = {USE_PRECOMPUTED_PHASE1}")
     print_resource_usage("Startup - before loading anything")
 
     # ---- ClickHouse writer for candidate_clusters / detected_events ----
     # source=DB_NAME ("telegram") for now; if other platforms get added
     # later, pass whichever table/platform name each run actually reads from.
-    results_writer = ClickHouseResultsWriter(db_name=DB_NAME, source=DB_NAME)
+    results_writer = ClickHouseResultsWriter(db_name=args.db_name, source=args.db_name)
 
     report_files = ["report_phase2_clustering.txt", "report_phase3_candidates.txt",
                      "report_phase4_verified_events.csv"]
     if not USE_PRECOMPUTED_PHASE1:
         report_files.append(PHASE1_REPORT_PATH)
-    for file in report_files:
-        open(file, "w", encoding="utf-8").close()
+    
 
     # ---- Build the list of per-day inputs to phase 2 ----
     grouped_data = None
@@ -296,15 +337,25 @@ def main():
         days_data = parse_phase1_report(PHASE1_REPORT_PATH)
         print(f"[Main] Loaded {len(days_data)} day(s) from the phase 1 report.")
     else:
-        loader = DataLoader(db_name=DB_NAME, table_name=TABLE_NAME)
-        df = loader.load_and_prepare(text_col='txtContent', date_col='date')
+        loader = DataLoader(db_name=args.db_name, table_name=args.table_name)
+        TEXT_COL = args.text_col or "txtContent"
+        DATE_COL = args.date_col or ("shdate" if loader.is_twitter else "date")
 
-        print("\n[Main] Applying date range filter...")
-        mask_range1 = (df['date'] >= '2025-08-23') & (df['date'] < '2025-08-24 23:59:59')
-        # mask_range2 = (df['date'] > '2025-08-24') & (df['date'] <= '2025-08-25 23:59:59')
-        # df = df[mask_range1 | mask_range2].copy()
-        df = df[mask_range1].copy()
-        print(f"[Main] Rows remaining after filter: {len(df)}")
+        df = loader.load_and_prepare(
+            text_col=TEXT_COL,
+            date_col=DATE_COL,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        #loader = DataLoader(db_name=args.db_name, table_name=args.table_name)
+        #df = loader.load_and_prepare(text_col=args.text_col, date_col=args.date_col)
+
+        # print("\n[Main] Applying date range filter...")
+        # mask_range1 = (df['date'] >= '2025-08-23') & (df['date'] < '2025-08-24 23:59:59')
+        # # mask_range2 = (df['date'] > '2025-08-24') & (df['date'] <= '2025-08-25 23:59:59')
+        # # df = df[mask_range1 | mask_range2].copy()
+        # df = df[mask_range1].copy()
+        # print(f"[Main] Rows remaining after filter: {len(df)}")
 
         grouped_data = df.groupby(pd.Grouper(key='date', freq='1D'))
 
@@ -367,7 +418,7 @@ def main():
 
         # ---- Load the light models (classifier/embedder/clusterer/extractor) for this day ----
         classifier, clusterer, extractor, EMBEDDING_DIM = load_light_models(
-            USE_PRECOMPUTED_PHASE1, CLASSIFIER_PATH,
+            USE_PRECOMPUTED_PHASE1, args.location_classifier_path,
             CLUSTERING_THRESHOLD, CLUSTERING_MAX_BLOCK_BYTES
         )
         ZERO_VECTOR = [0.0] * EMBEDDING_DIM
@@ -458,7 +509,7 @@ def main():
 
         # ---- Phase 4: LLM event verification - now runs right here, per day ----
         verifier = load_qwen_verifier(
-            QWEN_MODEL_PATH, QWEN_SAMPLE_SIZE, QWEN_MAX_NEW_TOKENS, QWEN_MAX_INPUT_TOKENS,
+            args.qwen_model_path, args.qwen_sample_size, args.qwen_max_new_tokens, args.qwen_max_input_tokens,
             QWEN_MAX_CONSECUTIVE_OOM_BEFORE_ABORT
         )
         phase4_start = time.time()
