@@ -319,7 +319,7 @@ def main():
     # ---- ClickHouse writer for candidate_clusters / detected_events ----
     # source=DB_NAME ("telegram") for now; if other platforms get added
     # later, pass whichever table/platform name each run actually reads from.
-    results_writer = ClickHouseResultsWriter(db_name=args.db_name, source=args.db_name)
+    results_writer = ClickHouseResultsWriter(db_name='raya_sepehr_analytical', source=args.db_name)
 
     report_files = ["report_phase2_clustering.txt", "report_phase3_candidates.txt",
                      "report_phase4_verified_events.csv"]
