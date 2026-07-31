@@ -1,8 +1,6 @@
    
 
-## python3 main.py --table-name "posts" --start-date "2025-08-24" --end-date "2025-08-24"
-
-
+## python3 main.py --table-name "posts" --start-date "2025-08-23" --end-date "2025-08-25"
 
 """
 main.py
@@ -22,44 +20,6 @@ Orchestrates the end-to-end event-prediction pipeline:
 Every stage's output is written to a CSV file (a plain text format) under
 <output-dir>/<YYYY-MM-DD>/ so each step can be inspected/audited independently
 and the pipeline can be resumed/debugged day by day.
-
-GPU MEMORY / MODEL LIFECYCLE
------------------------------
-Not every model fits on the GPU at the same time, so models are loaded and
-unloaded IN TURN, once per calendar day, instead of all being kept resident
-for the whole run:
-
-    for each day:
-        load   -> location NER model + embedding/similarity model
-        run    -> Stages 1-4 (data load, temporal+location extraction,
-                  clustering, embedding-based post-processing)
-        unload -> location NER model + embedding/similarity model
-        load   -> Qwen LLM verifier
-        run    -> Stage 5 (LLM verification)
-        unload -> Qwen LLM verifier
-        (next day loops back to loading the NER + embedding models again)
-
-The embedding/similarity model is a bit special: it lives as a MODULE-LEVEL
-singleton (`utils.similarity_model`) that `post_cluster.py` imports at
-*import time* (`from utils import similarity_model`). That means a normal
-top-level `from post_cluster import post_process_clusters` would only ever
-run that load once for the whole process and there would be no way to force
-it to unload/reload. To get real load/unload cycles out of it without
-touching post_cluster.py itself, this file:
-  1. evicts the `post_cluster` and `utils` modules from `sys.modules`,
-  2. re-imports `post_cluster` fresh (which re-triggers `utils`'s
-     module-level model load),
-  3. drops every reference to that freshly-imported module once Stage 4 is
-     done (including the local variable holding it - a stray reference
-     would keep the old embedding model reachable and un-collectable via
-     the function's `__globals__`),
-  4. evicts both modules from `sys.modules` again, then forces a
-     gc + CUDA cache cleanup.
-
-All local models (location NER model, embedding model used inside
-post_cluster.py's `utils.similarity_model`) are expected to already be
-available at the paths configured below / passed on the command line -
-this script does not download anything.
 """
 
 import os
@@ -87,10 +47,6 @@ from location_extractor import LocationExtractor
 from event_clusterer import process_clusters
 from event_verifier import QwenEventVerifier
 from data_writer import VerifiedEventsWriter
-# NOTE: post_cluster is intentionally NOT imported at module level - see the
-# "GPU MEMORY / MODEL LIFECYCLE" note above and load_ner_and_embedding() /
-# unload_ner_and_embedding() below.
-
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -137,13 +93,7 @@ def _empty_cuda_cache():
 
 
 def unload_object(obj, logger: logging.Logger, label: str):
-    """Best-effort GPU/CPU memory release for a loaded model wrapper.
-
-    We don't necessarily know every attribute name a given model wrapper
-    uses internally, so we proactively drop every commonly-named heavy
-    attribute (model/tokenizer/pipeline/...) if present, drop the object
-    itself, then force Python + CUDA to actually reclaim the memory.
-    """
+    """Best-effort GPU/CPU memory release for a loaded model wrapper."""
     if obj is None:
         return
     heavy_attr_names = (
@@ -162,40 +112,34 @@ def unload_object(obj, logger: logging.Logger, label: str):
     logger.info(f"{label} unloaded, GPU/CPU memory released.")
 
 
-def load_ner_and_embedding(args, logger: logging.Logger):
-    """(Re)loads BOTH GPU-resident models needed for Stages 2-4 of a single
-    day: the location NER model, and the embedding/similarity model used
-    inside post_cluster.py. Returns (location_extractor, post_cluster_module).
-
-    post_cluster is (re-)imported fresh every time this is called - see the
-    module docstring for why that's necessary to get a real load/unload
-    cycle out of its module-level embedding-model singleton.
-    """
-    logger.info("Loading location NER model + embedding model (Stages 2-4) ...")
-
+def load_ner(args, logger: logging.Logger):
+    """Loads the GPU-resident location NER model needed for Stage 2."""
+    logger.info("Loading location NER model (Stage 2) ...")
     location_extractor = LocationExtractor(
         model_path=args.location_model_path,
         device=0,
     )
+    logger.info("Location NER model loaded successfully.")
+    return location_extractor
 
+
+def unload_ner(location_extractor, logger: logging.Logger):
+    """Unloads the location NER model freeing its GPU memory."""
+    unload_object(location_extractor, logger, "Location NER model")
+
+
+def load_embedding(logger: logging.Logger):
+    """Loads the embedding/similarity model used inside post_cluster.py for Stage 4."""
+    logger.info("Loading embedding/similarity model (Stage 4) ...")
     for mod_name in ("post_cluster", "utils"):
         sys.modules.pop(mod_name, None)
     post_cluster_module = importlib.import_module("post_cluster")
+    logger.info("Embedding/similarity model loaded successfully.")
+    return post_cluster_module
 
-    logger.info("Location NER model + embedding model loaded successfully.")
-    return location_extractor, post_cluster_module
 
-
-def unload_ner_and_embedding(location_extractor, post_cluster_module, logger: logging.Logger):
-    """Unloads the location NER model and the embedding/similarity model,
-    freeing their GPU memory before the LLM is loaded."""
-    unload_object(location_extractor, logger, "Location NER model")
-
-    # Drop our only strong reference to the post_cluster module (and thus
-    # to the post_process_clusters function inside it, whose __globals__
-    # is what's actually keeping utils.similarity_model alive) BEFORE
-    # evicting the modules from sys.modules, otherwise the embedding model
-    # stays reachable and won't be garbage-collected.
+def unload_embedding(post_cluster_module, logger: logging.Logger):
+    """Unloads the embedding/similarity model freeing its GPU memory."""
     del post_cluster_module
     for mod_name in ("post_cluster", "utils"):
         sys.modules.pop(mod_name, None)
@@ -218,8 +162,7 @@ def load_llm(args, logger: logging.Logger) -> QwenEventVerifier:
 
 
 def unload_llm(qwen_verifier, logger: logging.Logger):
-    """Unloads the Qwen LLM verifier, freeing its GPU memory before the NER
-    + embedding models are loaded again for the next day."""
+    """Unloads the Qwen LLM verifier, freeing its GPU memory."""
     unload_object(qwen_verifier, logger, "Qwen LLM verifier")
 
 
@@ -290,9 +233,9 @@ def parse_args():
     parser.add_argument("--qwen-sample-size", type=int, default=10,
                          help="How many messages to randomly sample from each cluster and "
                               "send to the LLM for verification")
-    parser.add_argument("--qwen-max-new-tokens", type=int, default=300,
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=256,
                          help="max_new_tokens passed to QwenEventVerifier")
-    parser.add_argument("--qwen-max-input-tokens", type=int, default=5600,
+    parser.add_argument("--qwen-max-input-tokens", type=int, default=4800,
                          help="max_input_tokens passed to QwenEventVerifier")
     parser.add_argument("--skip-llm-verification", action="store_true",
                          help="Skip Stage 5 (Qwen LLM verification) entirely - useful for "
@@ -302,11 +245,6 @@ def parse_args():
 
 
 def _most_common(series: Optional[pd.Series]):
-    """Returns the most frequent non-null value in a Series, or None if
-    there isn't one. Stage 3 only ever clusters messages that already share
-    the same future_date, so this is normally just "the" value - mode() is
-    only there to be safe in case Stage 4 merged two near-duplicate
-    clusters whose dates weren't byte-identical."""
     if series is None:
         return None
     vals = series.dropna()
@@ -317,10 +255,6 @@ def _most_common(series: Optional[pd.Series]):
 
 
 def _first_location(value):
-    """location_entities can come in as a real Python list (fresh from
-    Stage 2), or as a stringified list like "['ØªÙ‡Ø±Ø§Ù†']" if the dataframe was
-    round-tripped through a CSV - normalize either case down to a single
-    location string (its first entity)."""
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
@@ -350,12 +284,6 @@ def _most_common_location(series: Optional[pd.Series]):
 
 
 def build_candidates_from_df(df: pd.DataFrame, text_col: str) -> list:
-    """
-    Builds candidates from Stage-4 dataframe.
-    Only clusters with more than 25 messages are kept.
-    For each remaining cluster, 15 random messages are sampled.
-    """
-
     candidates = []
 
     if "cluster_id" not in df.columns:
@@ -365,11 +293,11 @@ def build_candidates_from_df(df: pd.DataFrame, text_col: str) -> list:
 
     for cluster_id, group in clustered.groupby("cluster_id"):
 
-        # ÙÙ‚Ø· Ø®ÙˆØ´Ù‡â€ŒÙ‡Ø§ÛŒÛŒ Ú©Ù‡ Ø¨ÛŒØ´ØªØ± Ø§Ø² 25 Ù¾ÛŒØ§Ù… Ø¯Ø§Ø±Ù†Ø¯
+        # فقط خوشه‌هایی که بیشتر از 25 پیام دارند
         if len(group) <= 25:
             continue
 
-        # Ù†Ù…ÙˆÙ†Ù‡â€ŒÚ¯ÛŒØ±ÛŒ ØªØµØ§Ø¯ÙÛŒ 15 Ù¾ÛŒØ§Ù…
+        # نمونه‌گیری تصادفی 15 پیام
         sampled_group = group.sample(n=15, random_state=42)
 
         messages = (
@@ -385,7 +313,7 @@ def build_candidates_from_df(df: pd.DataFrame, text_col: str) -> list:
         candidates.append({
             "cluster_id": cluster_id,
             "messages": messages,
-            # Ø§ÛŒÙ† Ø¯Ùˆ ÙˆÛŒÚ˜Ú¯ÛŒ Ù‡Ù…Ú†Ù†Ø§Ù† Ø§Ø² Ú©Ù„ Ø®ÙˆØ´Ù‡ Ù…Ø­Ø§Ø³Ø¨Ù‡ Ù…ÛŒâ€ŒØ´ÙˆÙ†Ø¯
+            # این دو ویژگی همچنان از کل خوشه محاسبه می‌شوند
             "predicted_time": _most_common(group.get("future_date")),
             "predicted_location": _most_common_location(group.get("location_entities")),
         })
@@ -394,24 +322,6 @@ def build_candidates_from_df(df: pd.DataFrame, text_col: str) -> list:
 
 
 def build_event_records(verified_events: list, execution_time: str, source: str) -> pd.DataFrame:
-    """
-    Converts QwenEventVerifier.verify_candidates()'s output (candidates the
-    LLM confirmed as a genuine event) into the flat schema the events DB
-    table expects:
-
-        id, title, summary, predicted_time, predicted_location,
-        execution_time, source, sample_messages, created_at
-
-    - title / summary          -> from the LLM (candidate['event_title'] / ['event_summary'])
-    - predicted_time / _location -> from the Stage-4 dataframe (see build_candidates_from_df)
-    - sample_messages          -> the exact <=15 messages sampled and sent to the LLM
-                                   (candidate['sample_messages'], added in ev.py)
-    - source                   -> the social network the messages came from (Telegram)
-    - execution_time           -> the calendar day this batch of messages was processed by
-                                   the pipeline (day_start) - i.e. "today" for the purposes
-                                   of the LLM's freshness check
-    - id / created_at          -> generated here, at record-build time
-    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     for ev in verified_events:
@@ -431,7 +341,7 @@ def build_event_records(verified_events: list, execution_time: str, source: str)
 
 
 # --------------------------------------------------------------------------- #
-# Per-day pipeline - Stages 1-4 (needs the NER + embedding models loaded)
+# Per-day pipeline - Stages 1-4
 # --------------------------------------------------------------------------- #
 def run_pre_llm_stages(
     day_start: str,
@@ -439,8 +349,7 @@ def run_pre_llm_stages(
     day_index: int,
     total_days: int,
     loader: DataLoader,
-    location_extractor: LocationExtractor,
-    post_cluster_module,
+    args,
     text_col: str,
     date_col: str,
     output_dir: str,
@@ -449,12 +358,6 @@ def run_pre_llm_stages(
     """Runs Stages 1-4 for a single calendar day: data loading, temporal
     extraction, NER-based location/event extraction, clustering, and
     embedding-based post-processing.
-
-    Requires `location_extractor` and `post_cluster_module` to already be
-    loaded (see load_ner_and_embedding()). Does not touch the LLM at all.
-
-    Returns the Stage-4 post-processed dataframe, or None if there was
-    nothing to process / an error occurred.
     """
     logger.info("-" * 70)
     logger.info(f"[Day {day_index}/{total_days}] Processing {day_start}")
@@ -483,8 +386,7 @@ def run_pre_llm_stages(
     save_stage_output(day_df, day_out_dir, "01_raw_messages", logger)
 
     # --------------------------------------------------------------- #
-    # Stage 2a: temporal extraction (future date) - cheap, regex-based,
-    # runs on every row.
+    # Stage 2a: temporal extraction (future date)
     # --------------------------------------------------------------- #
     logger.info(f"[Day {day_index}/{total_days}] Stage 2/4 (Temporal Extraction) starting ...")
     day_df = process_temporal_data(day_df, text_col=text_col, date_col=date_col)
@@ -497,10 +399,6 @@ def run_pre_llm_stages(
 
     # --------------------------------------------------------------- #
     # Stage 2b: location extraction (GPU/NER, the expensive part).
-    # EventClusterer only ever clusters rows that have BOTH a future
-    # date AND a location, so there is no point running NER on rows
-    # that already failed the future-date check - this is the main
-    # lever for cutting the per-day runtime down.
     # --------------------------------------------------------------- #
     day_df["location_entities"] = None
     day_df["event_entities"] = None
@@ -511,7 +409,15 @@ def run_pre_llm_stages(
             f"{len(day_df) - n_future} row(s))..."
         )
         future_subset = day_df.loc[future_mask].copy()
-        future_subset = location_extractor.extract_entities(future_subset, text_col=text_col)
+        
+        # Load NER only when needed for Stage 2b
+        location_extractor = load_ner(args, logger)
+        try:
+            future_subset = location_extractor.extract_entities(future_subset, text_col=text_col)
+        finally:
+            # Unload NER right after Stage 2b is complete
+            unload_ner(location_extractor, logger)
+
         day_df.loc[future_subset.index, "location_entities"] = future_subset["location_entities"]
         day_df.loc[future_subset.index, "event_entities"] = future_subset["event_entities"]
 
@@ -531,9 +437,7 @@ def run_pre_llm_stages(
     save_stage_output(day_df, day_out_dir, "02_temporal_location_extracted", logger)
 
     # --------------------------------------------------------------- #
-    # Stage 3: event clustering. Only messages that have BOTH a future
-    # date and a location are actually clustered - that filtering is
-    # done internally by EventClusterer.
+    # Stage 3: event clustering.
     # --------------------------------------------------------------- #
     logger.info(f"[Day {day_index}/{total_days}] Stage 3/4 (Event Clustering) starting ...")
     day_df = process_clusters(day_df, text_col=text_col)
@@ -543,11 +447,17 @@ def run_pre_llm_stages(
 
     # --------------------------------------------------------------- #
     # Stage 4: semantic post-processing (denoise / dedupe / merge).
-    # Uses the embedding/similarity model living inside post_cluster_module
-    # (a freshly (re)imported module - see load_ner_and_embedding()).
     # --------------------------------------------------------------- #
     logger.info(f"[Day {day_index}/{total_days}] Stage 4/5 (Cluster Post-Processing) starting ...")
-    day_df = post_cluster_module.post_process_clusters(day_df, text_col=text_col)
+    
+    # Load Embedding model right before Stage 4
+    post_cluster_module = load_embedding(logger)
+    try:
+        day_df = post_cluster_module.post_process_clusters(day_df, text_col=text_col)
+    finally:
+        # Unload Embedding model immediately after post_processing
+        unload_embedding(post_cluster_module, logger)
+        
     n_final = day_df["cluster_id"].notna().sum()
     logger.info(f"[Day {day_index}/{total_days}] Stage 4/5 complete: {n_final} row(s) remain clustered.")
     save_stage_output(day_df, day_out_dir, "04_post_processed", logger)
@@ -570,13 +480,7 @@ def run_llm_stage(
     source_name: str,
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    """Runs Stage 5 (LLM verification) on a single day's Stage-4 output.
-
-    Takes each surviving cluster, samples up to `qwen_sample_size` of its
-    messages, and asks QwenEventVerifier whether the cluster is really ONE
-    well-defined event. Only clusters the LLM confirms get turned into
-    DB-ready event records.
-    """
+    """Runs Stage 5 (LLM verification) on a single day's Stage-4 output."""
     day_out_dir = os.path.join(output_dir, day_start)
     events_df = make_empty_events_df()
 
@@ -616,49 +520,31 @@ def main():
     logger.info(f"Output directory : {args.output_dir}")
     if args.skip_llm_verification:
         logger.info("Stage 5 (LLM Verification) disabled via --skip-llm-verification.")
-    logger.info("Model lifecycle  : per-day - NER+embedding are loaded for Stages 1-4, fully "
-                "unloaded, then the LLM is loaded for Stage 5, then fully unloaded before the "
-                "next day starts (so at most one of the two ever sits on the GPU at once).")
+    logger.info("Model lifecycle  : per-stage - NER is loaded specifically for Stage 2, unloaded, "
+                "then Embedding is loaded for Stage 4, unloaded. Finally Qwen is loaded for Stage 5 "
+                "and unloaded.")
     logger.info("=" * 70)
 
-    # ------------------------------------------------------------------- #
-    # DataLoader is just a ClickHouse client - not a GPU model - so it's
-    # fine to instantiate it once and keep it for the whole run.
-    # ------------------------------------------------------------------- #
-    DB_NAME = "telegram"
-    TABLE_NAME = "posts"
     loader = DataLoader(db_name=args.db_name, table_name=args.table_name)
-    # loader = DataLoader(db_name=DB_NAME, table_name=TABLE_NAME)
-
     day_pairs = list(daterange(args.start_date, args.end_date))
     total_days = len(day_pairs)
     logger.info(f"Pipeline will process {total_days} day(s).")
 
     events_writer = VerifiedEventsWriter(
-    db_name="raya_sepehr_analytical",   # ÛŒØ§ Ù‡Ø± db_name ÙˆØ§Ù‚Ø¹ÛŒâ€ŒØªØ§Ù†
-    source=args.source_name,
-    event_table="predicted_events",      # Ø§Ø³Ù… Ø¬Ø¯ÙˆÙ„ Ø±Ø§ Ù‡Ø±Ú†Ù‡ Ù‡Ø³Øª Ø¨Ú¯Ø°Ø§Ø±ÛŒØ¯
-)
+        db_name="raya_sepehr_analytical",
+        source=args.source_name,
+        event_table="predicted_events",
+    )
     
     all_days_final = []
     all_events_final = []
 
     for day_index, (day_start, day_end) in enumerate(day_pairs, start=1):
         # ----------------------------------------------------------- #
-        # Step A: load the location NER model + the embedding model,
-        # run Stages 1-4, then unload BOTH before even considering the
-        # LLM - this is the point where a NER-only or embedding-only
-        # failure just skips today and moves on to tomorrow.
+        # Step A: run Stages 1-4.
+        # NER and Embedding are loaded and unloaded internally within
+        # run_pre_llm_stages exactly when they are needed.
         # ----------------------------------------------------------- #
-        try:
-            location_extractor, post_cluster_module = load_ner_and_embedding(args, logger)
-        except Exception:
-            logger.exception(
-                f"[Day {day_index}/{total_days}] Failed to load the NER/embedding models. "
-                f"Skipping {day_start} entirely."
-            )
-            continue
-
         try:
             day_df = run_pre_llm_stages(
                 day_start=day_start,
@@ -666,26 +552,24 @@ def main():
                 day_index=day_index,
                 total_days=total_days,
                 loader=loader,
-                location_extractor=location_extractor,
-                post_cluster_module=post_cluster_module,
+                args=args,
                 text_col=args.text_col,
                 date_col=args.date_col,
                 output_dir=args.output_dir,
                 logger=logger,
             )
-        finally:
-            unload_ner_and_embedding(location_extractor, post_cluster_module, logger)
+        except Exception:
+            logger.exception(
+                f"[Day {day_index}/{total_days}] Failed during Stages 1-4. "
+                f"Skipping {day_start} entirely."
+            )
+            continue
 
         if day_df is not None:
             all_days_final.append(day_df)
         
-    
-
         # ----------------------------------------------------------- #
-        # Step B: only if Stages 1-4 actually produced something, and
-        # Stage 5 wasn't disabled, load the LLM, run Stage 5, then
-        # unload it again - this is what frees the GPU back up for
-        # tomorrow's NER + embedding load.
+        # Step B: LLM stage.
         # ----------------------------------------------------------- #
         events_df = make_empty_events_df()
         if day_df is None:
@@ -717,7 +601,6 @@ def main():
                         output_dir=args.output_dir,
                         source_name=args.source_name,
                         logger=logger,
-                        
                     )
                 finally:
                     unload_llm(qwen_verifier, logger)
