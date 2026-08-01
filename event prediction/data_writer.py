@@ -1,39 +1,57 @@
-# python3 main.py --db-name "x" --table-name "tweets_2" --start-date "1404-06-01" --end-date "1404-06-14"
-
+# # python3 main.py --db-name "x" --table-name "tweets_2" --start-date "1404-06-01" --end-date "1404-06-14"
 
 import json
 import os
 from datetime import datetime
-
 import pandas as pd
+import jdatetime  # اضافه شدن کتابخانه تاریخ شمسی
 from clickhouse_connect import get_client
 
-
 def _as_datetime(value):
-    """Accepts a pandas Timestamp / python datetime / date-like / string
-    and returns a plain python datetime, which clickhouse_connect expects
-    for DateTime columns."""
     return pd.Timestamp(value).to_pydatetime()
-
 
 def _sample_json(messages, limit=15):
     return json.dumps({"messages": list((messages or [])[:limit])}, ensure_ascii=False)
 
+def _parse_and_standardize_datetime(value):
+    """
+    تاریخ را بررسی کرده و در صورت شمسی بودن، آن را به میلادی استاندارد می‌کند.
+    در صورت نامعتبر بودن یا خالی بودن، تاریخ پیش‌فرض ارسال می‌شود تا رکورد از دست نرود و خطا هم ندهد.
+    """
+    if not value:
+        return datetime(1970, 1, 1)
+    
+    val_str = str(value).strip()
+    
+    # بررسی فرمت شمسی (مثلاً با 13 یا 14 شروع شده باشد)
+    if val_str.startswith('13') or val_str.startswith('14'):
+        try:
+            # جایگزینی اسلش با خط تیره و جداسازی تاریخ از ساعت احتمالی
+            date_part = val_str.replace('/', '-').split(' ')[0]
+            y, m, d = map(int, date_part.split('-'))
+            
+            # تبدیل شمسی به میلادی
+            gregorian_date = jdatetime.date(y, m, d).togregorian()
+            return datetime(gregorian_date.year, gregorian_date.month, gregorian_date.day)
+        except Exception:
+            return datetime(1970, 1, 1)
+
+    # اگر شمسی نبود، با همان پانداس (میلادی) پارس شود
+    try:
+        dt = pd.Timestamp(value)
+        if pd.isna(dt):
+            return datetime(1970, 1, 1)
+        return dt.to_pydatetime()
+    except Exception:
+        return datetime(1970, 1, 1)
 
 class VerifiedEventsWriter:
-    """
-    One public method - save_events(...) - inserts one row per
-    LLM-confirmed event into `self.event_table`.
-    """
-
     def __init__(self, db_name="raya_sepehr_analytical", source="telegram",
                  event_table="predicted_events"):
         self.db_name = db_name
         self.source = source
         self.event_table = event_table
         self._client = None
-
-    # ---- connection ----
 
     def _get_client(self):
         if self._client is None:
@@ -51,8 +69,6 @@ class VerifiedEventsWriter:
             self._client.close()
             self._client = None
 
-    # ---- insert ----
-
     def save_events(self, verified_events, execution_time):
         if not verified_events:
             return
@@ -68,14 +84,13 @@ class VerifiedEventsWriter:
 
         rows = []
         for event in verified_events:
-            # بررسی و تبدیل زمان به آبجکت datetime به جای string
-            pred_time_raw = event.get('predicted_time')
-            pred_time_dt = _as_datetime(pred_time_raw) if pred_time_raw else None
+            # استفاده از تابع جدید برای تبدیل اتوماتیک شمسی به میلادی
+            pred_time_dt = _parse_and_standardize_datetime(event.get('predicted_time'))
 
             rows.append([
                 event.get('event_title') or 'N/A',
                 event.get('event_summary') or 'N/A',
-                pred_time_dt,  # <--- استفاده از آبجکت datetime به جای str()
+                pred_time_dt,
                 str(event.get('predicted_location') or ''),
                 exec_dt,
                 self.source,
@@ -93,7 +108,6 @@ class VerifiedEventsWriter:
                     'sample_messages', 'created_at',
                 ],
             )
-            print(f"[ClickHouse] Inserted {len(rows)} row(s) into "
-                  f"{self.event_table}")
+            print(f"[ClickHouse] Inserted {len(rows)} row(s) into {self.event_table}")
         except Exception as e:
             print(f"[ClickHouse] ERROR inserting into {self.event_table}: {e}")

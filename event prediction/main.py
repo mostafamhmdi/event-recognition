@@ -294,7 +294,7 @@ def build_candidates_from_df(df: pd.DataFrame, text_col: str) -> list:
     for cluster_id, group in clustered.groupby("cluster_id"):
 
         # فقط خوشه‌هایی که بیشتر از 25 پیام دارند
-        if len(group) <= 25:
+        if len(group) <= 20:
             continue
 
         # نمونه‌گیری تصادفی 15 پیام
