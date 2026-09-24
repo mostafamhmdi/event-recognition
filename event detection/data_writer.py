@@ -118,11 +118,11 @@ class ClickHouseResultsWriter:
     def _get_client(self):
         if self._client is None:
             self._client = get_client(
-                host=os.getenv("CH_HOST", '172.20.70.191'),
-                port=int(os.getenv("CH_PORT", 8123)),
+                host=os.getenv("CH_HOST"),
+                port=int(os.getenv("CH_PORT")),
                 database=self.db_name,
-                username=os.getenv("CH_USER", 'labafi'),
-                password=os.getenv("CH_PASS", 'l@b@fi@1234')
+                username=os.getenv("CH_USER"),
+                password=os.getenv("CH_PASS")
             )
         return self._client
 
