@@ -38,22 +38,21 @@ class DataLoader:
 
     def _get_ch_client(self):
         return get_client(
-            host=os.getenv("CH_HOST", '172.20.70.191'),
-            port=int(os.getenv("CH_PORT", 8123)),
+            host=os.getenv("CH_HOST"),
+            port=int(os.getenv("CH_PORT")),
             database=self.db_name,
-            username=os.getenv("CH_USER", 'labafi'),
-            password=os.getenv("CH_PASS", 'l@b@fi@1234')
+            username=os.getenv("CH_USER"),
+            password=os.getenv("CH_PASS")
         )
 
     @staticmethod
     def _get_pg_conn():
-        # Same Postgres (topics / topic_keywords) used by sts_job_fin.py
         return pg8000.connect(
-            host=os.getenv("PG_HOST", '172.20.70.191'),
-            port=int(os.getenv("PG_PORT", 5432)),
-            database=os.getenv("PG_DB", 'olap'),
-            user=os.getenv("PG_USER", 'labafi'),
-            password=os.getenv("PG_PASS", 'l@b@fi@1234')
+            host=os.getenv("PG_HOST"),
+            port=int(os.getenv("PG_PORT")),
+            database=os.getenv("PG_DB"),
+            user=os.getenv("PG_USER"),
+            password=os.getenv("PG_PASS")
         )
 
     @classmethod
@@ -107,13 +106,6 @@ class DataLoader:
         text_col = text_col or 'txtContent'
         current_date_col = date_col or 'shdate'
 
-        # ---------------------------------------------------------
-        # Optional topic-keyword condition (same idea as sts_job_fin.py:
-        # fetch_topics_map + multiSearchAny). This only ADDS a keyword
-        # condition on top of whatever date range is already requested -
-        # the existing date-range / social-network (db_name) logic below
-        # is untouched.
-        # ---------------------------------------------------------
         keyword_condition_sql = None
         if filter_by_topic:
             if topic_id is None:
@@ -139,9 +131,7 @@ class DataLoader:
 
             client = self._get_ch_client()
 
-            # ---------------------------------------------------------
-            # ??? ? ? ?: ????? ????? (??????/????????)
-            # ---------------------------------------------------------
+
             query = f"SELECT * FROM {self.table_name}"
             conditions = []
 
@@ -242,9 +232,6 @@ class DataLoader:
                     
                     df = df.drop(columns=['row_key'])
 
-            # ---------------------------------------------------------
-            # ??? ?: ?????? ? ????? sentiment ? emotion_label ???? ??????
-            # ---------------------------------------------------------
             elif not self.is_twitter and not df.empty:
                 if 'channel' in df.columns and 'msgid' in df.columns:
                     print("[DataLoader] Fetching comments and analytical data for Telegram posts...")
@@ -253,14 +240,12 @@ class DataLoader:
                     post_keys_list = df['post_key'].unique().tolist()
                     
                     try:
-                        # ?. ????? ???????? ?? ???? Batch (???? ??????? ?? ???? HTTP 400)
                         batch_size = 1000
                         all_comments_dfs = []
                         
                         for i in range(0, len(post_keys_list), batch_size):
                             batch_keys = post_keys_list[i:i + batch_size]
                             
-                            # ??????? ?? concat ???? ????????? ???? ?? ??? ???? ?? post_key
                             c_query = """
                                 SELECT channel, msgid, comment_id
                                 FROM telegram.comments
@@ -269,7 +254,6 @@ class DataLoader:
                             batch_df = client.query_df(c_query, parameters={'pk': batch_keys})
                             all_comments_dfs.append(batch_df)
                             
-                        # ????? ???? ???????????? ????????
                         comments_df = pd.concat(all_comments_dfs, ignore_index=True) if all_comments_dfs else pd.DataFrame()
                         
                         if not comments_df.empty:
@@ -278,7 +262,6 @@ class DataLoader:
                             
                             c_keys = comments_df['row_key'].unique().tolist()
                             
-                            # ?. ????? ???????? ?????? ?? ???? Batch (?????? ???? ??????? ?? HTTP 400)
                             all_an_dfs = []
                             for i in range(0, len(c_keys), batch_size):
                                 batch_an_keys = c_keys[i:i + batch_size]
@@ -344,7 +327,6 @@ class DataLoader:
                 else:
                     print("[DataLoader] WARNING: 'channel' or 'msgid' columns not found. Cannot fetch Telegram comments.")
 
-            # ???? ??????? ?? ???? ???????? ???? ?????? ?? ????? (??? ??? ???? ?????)
             for col in ['sentiment', 'sentiment_std', 'emotion_label']:
                 if col not in df.columns:
                     df[col] = None
