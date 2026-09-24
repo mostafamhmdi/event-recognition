@@ -18,8 +18,7 @@ import pg8000
 
 
 class DataLoader:
-    # db_name values that should be treated as "Twitter/X"
-    # updated db names to work with shdate
+
     TWITTER_DB_NAMES = {"x", "twitter", "telegram", "eita", "rubika", "bale"}
 
     # Jalali dates validation (YYYY-MM-DD)
@@ -39,11 +38,11 @@ class DataLoader:
         (falling back to default values if they are not set).
         """
         return get_client(
-            host=os.getenv("CH_HOST", '172.20.70.191'),
-            port=int(os.getenv("CH_PORT", 8123)),
+            host=os.getenv("CH_HOST"),
+            port=int(os.getenv("CH_PORT")),
             database=self.db_name,
-            username=os.getenv("CH_USER", 'labafi'),
-            password=os.getenv("CH_PASS", 'l@b@fi@1234')
+            username=os.getenv("CH_USER"),
+            password=os.getenv("CH_PASS")
         )
 
     @staticmethod
@@ -51,11 +50,11 @@ class DataLoader:
         """Connection to the Postgres DB that holds 'topics' / 'topic_keywords'
         (same DB/credentials sts_job_fin.py uses)."""
         return pg8000.connect(
-            host=os.getenv("PG_HOST", '172.20.70.191'),
-            port=int(os.getenv("PG_PORT", 5432)),
-            database=os.getenv("PG_DB", 'olap'),
-            user=os.getenv("PG_USER", 'labafi'),
-            password=os.getenv("PG_PASS", 'l@b@fi@1234')
+            host=os.getenv("PG_HOST"),
+            port=int(os.getenv("PG_PORT")),
+            database=os.getenv("PG_DB"),
+            user=os.getenv("PG_USER"),
+            password=os.getenv("PG_PASS")
         )
 
     @classmethod
@@ -114,7 +113,6 @@ class DataLoader:
         topic_id: Optional[int] = None,
     ) -> pd.DataFrame:
 
-        # ??? ????? ?? (Twitter, Telegram, ...) ?????? ????? ?? ???? shdate ? ???? ????? ??????
         text_col = text_col or 'txtContent'
         current_date_col = date_col or 'shdate'
 
@@ -172,10 +170,6 @@ class DataLoader:
             print(f"[DataLoader] Running Phase 1 (shdate): {query}")
             df = client.query_df(query)
 
-            # ---------------------------------------------------------
-            # Phase 2: if nothing was found on shdate, convert the Jalali
-            # range to Gregorian and retry against the 'date' column
-            # ---------------------------------------------------------
             if df.empty and (start_date or end_date):
                 print(f"[DataLoader] No records found using '{current_date_col}'. Trying Phase 2 (Gregorian fallback on 'date').")
                 g_start = self._shamsi_to_gregorian(start_date) if start_date else None
