@@ -8,6 +8,24 @@ from datetime import datetime
 import pandas as pd
 from clickhouse_connect import get_client
 
+# ---------------------------------------------------------------------------
+# ONE-TIME MIGRATION REQUIRED before save_candidate_clusters() below will
+# work: candidate_clusters needs 5 new columns. Run this once against the
+# real table before deploying this file:
+#
+#   ALTER TABLE raya_sepehr_analytical.candidate_clusters
+#       ADD COLUMN date_shamsi String DEFAULT '',
+#       ADD COLUMN z_score Float32 DEFAULT 0,
+#       ADD COLUMN median_sim Float32 DEFAULT 0,
+#       ADD COLUMN coverage Float32 DEFAULT 0,
+#       ADD COLUMN centroid_embedding Array(Float32) DEFAULT [];
+#
+# دو ستون زیر هم برای رول چهارم (Emotional_Reaction) و امتیاز اهمیت خوشه لازم‌اند:
+#   ALTER TABLE raya_sepehr_analytical.candidate_clusters
+#       ADD COLUMN has_emotional_reaction UInt8 DEFAULT 0,
+#       ADD COLUMN importance_score Float32 DEFAULT 0;
+# ---------------------------------------------------------------------------
+
 
 
 def _as_datetime(value):
@@ -25,13 +43,50 @@ def _sample(messages, limit=10):
 
 
 def _text_field_or_empty(cand, key):
-    """`keywords`/`sentiment_polarity` are non-Nullable String columns,
-    so a real None crashes the whole insert. If candidate_extractor.py
-    starts producing cand['keywords'] / cand['sentiment_polarity']
-    itself, this picks it up automatically; until then it falls back to
-    '' (the closest thing to "no value" this column type allows)."""
+    """`keywords`/`sentiment_polarity`/`date_shamsi` are non-Nullable
+    String columns, so a real None crashes the whole insert. If
+    candidate_extractor.py starts producing cand['keywords'] /
+    cand['sentiment_polarity'] itself, this picks it up automatically;
+    until then it falls back to '' (the closest thing to "no value"
+    this column type allows)."""
     value = cand.get(key)
     return value if value else ""
+
+def _int_or_none(cand, key):
+    """dominant_emotion یک عدد صحیح 0 تا 6 است یا None (نه رشته) - این
+    برخلاف keywords/sentiment_label، None واقعی برمی‌گرداند چون ستون
+    مقصد باید Nullable باشد."""
+    value = cand.get(key)
+    return int(value) if value is not None else None
+
+def _metric_or_default(cand, key, default=0.0):
+    """z_score/median_sim/coverage live inside cand['metrics'] (a nested
+    dict produced by candidate_extractor.py), not at the top level. Falls
+    back to `default` if 'metrics' or the specific key is missing, so an
+    older-format candidate dict doesn't crash the insert."""
+    metrics = cand.get('metrics') or {}
+    value = metrics.get(key)
+    return float(value) if value is not None else default
+
+
+def _importance_score_or_default(cand, default=0.0):
+    """importance_score یک عدد Float32 در candidate_extractor.py محاسبه
+    می‌شود (سطح بالای cand، نه داخل 'metrics'). اگر یک candidate قدیمی‌تر
+    این کلید را نداشته باشد، به‌جای کرش کردن insert، مقدار default
+    برگردانده می‌شود."""
+    value = cand.get('importance_score')
+    return float(value) if value is not None else default
+
+
+def _centroid_or_empty(cand):
+    """centroid_embedding must be a flat list of Python floats for
+    ClickHouse's Array(Float32) column. Falls back to an empty list if
+    missing (e.g. a candidate produced before this field existed) rather
+    than crashing the insert."""
+    centroid = cand.get('centroid_embedding')
+    if not centroid:
+        return []
+    return [float(x) for x in centroid]
 
 
 class ClickHouseResultsWriter:
@@ -130,10 +185,18 @@ class ClickHouseResultsWriter:
                 int(cand.get('size', 0) or 0),
                 1 if 'Spike' in reasons else 0,
                 1 if 'Cohesive_Large' in reasons else 0,
-                _text_field_or_empty(cand, 'sentiment_polarity'),
+                _text_field_or_empty(cand, 'sentiment_label'),
+                _int_or_none(cand, 'dominant_emotion'),
                 exec_dt,
                 'pending',
                 _sample(messages),
+                _text_field_or_empty(cand, 'date_shamsi'),
+                _metric_or_default(cand, 'z_score'),
+                _metric_or_default(cand, 'median_sim'),
+                _metric_or_default(cand, 'coverage'),
+                _centroid_or_empty(cand),
+                1 if 'Emotional_Reaction' in reasons else 0,
+                _importance_score_or_default(cand),
             ])
 
         self._next_candidate_id = next_id
@@ -145,8 +208,11 @@ class ClickHouseResultsWriter:
                 rows,
                 column_names=[
                     'id', 'keywords', 'is_large', 'cluster_size', 'has_burst',
-                    'is_cohesive', 'sentiment_polarity', 'execution_time',
+                    'is_cohesive', 'sentiment_polarity', 'dominant_emotion', 'execution_time',
                     'validation_status', 'sample_messages',
+                    'date_shamsi', 'z_score', 'median_sim', 'coverage',
+                    'centroid_embedding',
+                    'has_emotional_reaction', 'importance_score',
                 ],
             )
             print(f"[ClickHouse] Inserted {len(rows)} row(s) into "
@@ -230,9 +296,6 @@ class ClickHouseResultsWriter:
             event['_db_id'] for event in day_verified_events
             if event.get('_db_id') is not None
         }
-        # Only mark candidates 'rejected' that Phase 4 actually had a shot
-        # at - i.e. it had messages (maain.py's own Phase 4 loop already
-        # skips messageless candidates before calling verify_candidates).
         rejected_ids = {
             cand['_db_id'] for cand in day_candidates
             if cand.get('_db_id') is not None

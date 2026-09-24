@@ -1,5 +1,3 @@
-   
-
 ## python3 main.py --table-name "posts" --start-date "2025-08-23" --end-date "2025-08-25"
 
 """
@@ -34,6 +32,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
+import jdatetime
 import pandas as pd
 
 try:
@@ -169,28 +168,40 @@ def unload_llm(qwen_verifier, logger: logging.Logger):
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _parse_jalali(date_str: str) -> jdatetime.date:
+    """Parse a 'YYYY-MM-DD' Jalali (Shamsi) date string, e.g. '1404-06-31'.
+
+    NOTE: --start-date/--end-date (and shdate in the DB) are Jalali dates,
+    NOT Gregorian. Using datetime.strptime(..., "%Y-%m-%d") here used to
+    validate them against the *Gregorian* calendar instead - which crashes
+    on perfectly valid Jalali dates. Jalali months 1-6 (e.g. Shahrivar/06)
+    have 31 days, but the same month NUMBER in the Gregorian calendar
+    (e.g. June/06) only has 30, so a date like '1404-06-31' raised
+    "ValueError: day is out of range for month" even though it's a real day.
+    Parsing with jdatetime (Jalali calendar rules) instead of datetime
+    (Gregorian calendar rules) fixes that.
+    """
+    year, month, day = map(int, date_str.split("-"))
+    return jdatetime.date(year, month, day)
+
+
 def daterange(start: str, end: str):
-    """Yield (day_start, day_end) 'YYYY-MM-DD' string pairs, one per calendar
-    day, covering the half-open interval [start, end)."""
-    start_dt = datetime.strptime(start, "%Y-%m-%d")
-    end_dt = datetime.strptime(end, "%Y-%m-%d")
+    """Yield (day_start, day_end) 'YYYY-MM-DD' Jalali string pairs, one per
+    calendar day, covering the half-open interval [start, end)."""
+    start_dt = _parse_jalali(start)
+    end_dt = _parse_jalali(end)
     if end_dt <= start_dt:
         raise ValueError(f"end_date ({end}) must be after start_date ({start})")
 
     current = start_dt
     while current < end_dt:
         nxt = current + timedelta(days=1)
-        yield current.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
+        yield (f"{current.year:04d}-{current.month:02d}-{current.day:02d}",
+               f"{nxt.year:04d}-{nxt.month:02d}-{nxt.day:02d}")
         current = nxt
 
 
-def save_stage_output(df: pd.DataFrame, out_dir: str, stage_name: str, logger: logging.Logger) -> str:
-    """Persist a stage's dataframe to a CSV (plain text) file and log where it went."""
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{stage_name}.csv")
-    df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info(f"Saved stage output -> {out_path} ({len(df)} row(s))")
-    return out_path
+
 
 
 EVENT_COLUMNS = [
@@ -216,6 +227,15 @@ def parse_args():
 
     parser.add_argument("--start-date", required=True, help="Start date, inclusive (YYYY-MM-DD)")
     parser.add_argument("--end-date", required=True, help="End date, exclusive (YYYY-MM-DD)")
+
+    parser.add_argument("--topic-id", type=int, default=None,
+                         help="Topic ID whose keywords (from the Postgres 'topic_keywords' "
+                              "table, same source sts_job_fin.py uses) will be used to filter "
+                              "fetched messages. Only takes effect when --filter-by-topic is set.")
+    parser.add_argument("--filter-by-topic", action="store_true",
+                         help="If set (together with --topic-id), only fetch messages that "
+                              "contain at least one of that topic's keywords, on top of the "
+                              "existing date-range/social-network filtering.")
 
     parser.add_argument("--location-model-path", default="../../models/arman NER",
                          help="Local path to the location NER model used by LocationExtractor")
@@ -372,6 +392,8 @@ def run_pre_llm_stages(
             date_col=date_col,
             start_date=day_start,
             end_date=day_end,
+            filter_by_topic=args.filter_by_topic,
+            topic_id=args.topic_id,
         )
     except Exception:
         logger.exception(f"[Day {day_index}/{total_days}] Failed to load data for {day_start}. Skipping this day.")
@@ -383,7 +405,7 @@ def run_pre_llm_stages(
 
     day_df = day_df.reset_index(drop=True)
     logger.info(f"[Day {day_index}/{total_days}] Stage 1/4 (Data Loading) complete: {len(day_df)} row(s) fetched.")
-    save_stage_output(day_df, day_out_dir, "01_raw_messages", logger)
+
 
     # --------------------------------------------------------------- #
     # Stage 2a: temporal extraction (future date)
@@ -434,7 +456,7 @@ def run_pre_llm_stages(
             f"[Day {day_index}/{total_days}] No rows with a future date today - "
             f"skipping location/event extraction entirely."
         )
-    save_stage_output(day_df, day_out_dir, "02_temporal_location_extracted", logger)
+
 
     # --------------------------------------------------------------- #
     # Stage 3: event clustering.
@@ -443,7 +465,7 @@ def run_pre_llm_stages(
     day_df = process_clusters(day_df, text_col=text_col)
     n_clustered = day_df["cluster_id"].notna().sum()
     logger.info(f"[Day {day_index}/{total_days}] Stage 3/4 complete: {n_clustered} row(s) assigned to a cluster.")
-    save_stage_output(day_df, day_out_dir, "03_event_clustered", logger)
+
 
     # --------------------------------------------------------------- #
     # Stage 4: semantic post-processing (denoise / dedupe / merge).
@@ -460,7 +482,7 @@ def run_pre_llm_stages(
         
     n_final = day_df["cluster_id"].notna().sum()
     logger.info(f"[Day {day_index}/{total_days}] Stage 4/5 complete: {n_final} row(s) remain clustered.")
-    save_stage_output(day_df, day_out_dir, "04_post_processed", logger)
+
 
     return day_df
 
@@ -495,7 +517,6 @@ def run_llm_stage(
         )
         logger.info(f"[Day {day_index}/{total_days}] Stage 5/5 complete: "
                      f"{len(events_df)}/{len(candidates)} cluster(s) confirmed as events.")
-        save_stage_output(events_df, day_out_dir, "05_verified_events", logger)
     else:
         logger.info(f"[Day {day_index}/{total_days}] Stage 5/5: no clusters to verify.")
 
@@ -518,6 +539,8 @@ def main():
     logger.info(f"Date range       : {args.start_date} -> {args.end_date} (exclusive)")
     logger.info(f"Location model   : {args.location_model_path}")
     logger.info(f"Output directory : {args.output_dir}")
+    if args.filter_by_topic:
+        logger.info(f"Topic filter     : ENABLED (topic_id={args.topic_id})")
     if args.skip_llm_verification:
         logger.info("Stage 5 (LLM Verification) disabled via --skip-llm-verification.")
     logger.info("Model lifecycle  : per-stage - NER is loaded specifically for Stage 2, unloaded, "
@@ -616,14 +639,12 @@ def main():
     logger.info("=" * 70)
     if all_days_final:
         combined_df = pd.concat(all_days_final, ignore_index=True)
-        save_stage_output(combined_df, args.output_dir, "00_all_days_combined", logger)
         logger.info(f"Pipeline finished successfully. Total rows processed across all days: {len(combined_df)}.")
     else:
         logger.warning("Pipeline finished, but no day produced any data.")
 
     if all_events_final:
         combined_events_df = pd.concat(all_events_final, ignore_index=True)
-        save_stage_output(combined_events_df, args.output_dir, "00_all_events_combined", logger)
         logger.info(f"Total verified events across all days (DB-ready): {len(combined_events_df)}.")
     else:
         logger.warning("No verified events were produced across any day.")

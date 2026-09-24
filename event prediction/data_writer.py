@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from datetime import datetime
 import pandas as pd
 import jdatetime  # اضافه شدن کتابخانه تاریخ شمسی
@@ -71,7 +72,7 @@ class VerifiedEventsWriter:
 
     def save_events(self, verified_events, execution_time):
         if not verified_events:
-            return
+            return True
 
         exec_dt = _as_datetime(execution_time)
         created_dt = datetime.now()
@@ -83,11 +84,25 @@ class VerifiedEventsWriter:
             raise
 
         rows = []
-        for event in verified_events:
+        # 'id' used to be left out of the INSERT entirely, so ClickHouse
+        # silently filled it with the column's default (0) on every single
+        # row - that's why the table shows id = 0 for everything. If
+        # 'predicted_events' is a Replacing/Collapsing/AggregatingMergeTree
+        # with 'id' in its ORDER BY (a very common pattern for a table
+        # named like this), ClickHouse treats every id=0 row as the SAME
+        # logical row and can silently collapse them down to just one
+        # survivor on the next background merge - i.e. real, silent loss
+        # of previously "saved" events. Giving every row its own unique id
+        # fixes that regardless of which MergeTree variant the table uses.
+        # Nanosecond epoch + row offset keeps ids unique within a batch and
+        # comfortably fits a UInt64 id column (no overflow risk).
+        base_id = time.time_ns()
+        for i, event in enumerate(verified_events):
             # استفاده از تابع جدید برای تبدیل اتوماتیک شمسی به میلادی
             pred_time_dt = _parse_and_standardize_datetime(event.get('predicted_time'))
 
             rows.append([
+                base_id + i,
                 event.get('event_title') or 'N/A',
                 event.get('event_summary') or 'N/A',
                 pred_time_dt,
@@ -103,11 +118,18 @@ class VerifiedEventsWriter:
                 self.event_table,
                 rows,
                 column_names=[
-                    'title', 'summary', 'predicted_time',
+                    'id', 'title', 'summary', 'predicted_time',
                     'predicted_location', 'execution_time', 'source',
                     'sample_messages', 'created_at',
                 ],
             )
             print(f"[ClickHouse] Inserted {len(rows)} row(s) into {self.event_table}")
+            return True
         except Exception as e:
+            # این خطا قبلاً فقط پرینت می‌شد و کد صدازننده هیچ‌وقت متوجه
+            # شکست نمی‌شد (چون خروجی این تابع چک نمی‌شد) - یعنی اگر اینسرت
+            # به هر دلیلی (مثلاً mismatch نوع ستون) fail می‌شد، لاگ‌ها هنوز
+            # "موفق" نشون می‌دادن. الان return False می‌کنیم تا صدازننده
+            # (main.py) در صورت تمایل بتونه شکست رو تشخیص بده.
             print(f"[ClickHouse] ERROR inserting into {self.event_table}: {e}")
+            return False

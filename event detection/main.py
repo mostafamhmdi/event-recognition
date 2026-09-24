@@ -27,19 +27,6 @@ def now_str():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
-def append_phase1_report_txt(daily_item, filename="report_phase1_classification.txt"):
-    with open(filename, "a", encoding="utf-8") as f:
-        g_date = daily_item["date"].strftime('%Y-%m-%d')
-        sh_date = jdatetime.datetime.fromgregorian(datetime=daily_item["date"]).strftime("%Y/%m/%d")
-        f.write(f"Date (Jalali): {sh_date} | (Gregorian): {g_date}\n")
-        f.write(f"Total raw messages: {daily_item['raw_count']} | Filtered out: {daily_item['filtered_count']}\n")
-        f.write("-" * 70 + "\n")
-        for i, (msg, ts) in enumerate(zip(daily_item["valid_clean_msgs"], daily_item["valid_timestamps"]), 1):
-            ts_str = ts.strftime('%H:%M:%S') if hasattr(ts, 'strftime') else str(ts)
-            f.write(f" {i}. [{ts_str}] {msg}\n")
-        f.write("\n" + "=" * 70 + "\n\n")
-
-
 def parse_phase1_report(filename="report_phase1_classification.txt"):
     
     if not os.path.exists(filename):
@@ -96,70 +83,6 @@ def parse_phase1_report(filename="report_phase1_classification.txt"):
     days.sort(key=lambda d: d["date"])
     return days
 
-
-def append_phase2_report_txt(daily_data, filename="report_phase2_clustering.txt"):
-    with open(filename, "a", encoding="utf-8") as f:
-        f.write(f"Date (Jalali): {daily_data['date_shamsi']} | "
-                f"(Gregorian): {daily_data['date_gregorian'].strftime('%Y-%m-%d')}\n")
-        f.write(f"Clusters found (with more than 1 message): {len(daily_data['communities'])}\n")
-        f.write("-" * 70 + "\n")
-        valid_msgs = daily_data["valid_texts"]
-        valid_timestamps = daily_data["valid_timestamps"]
-        for cluster_idx, comm_indices in enumerate(daily_data["communities"], 1):
-            f.write(f"\n Cluster #{cluster_idx} ({len(comm_indices)} message(s)):\n")
-            for idx in comm_indices:
-                msg = valid_msgs[idx]
-                ts = valid_timestamps[idx]
-                ts_str = ts.strftime('%H:%M:%S') if hasattr(ts, 'strftime') else str(ts)
-                f.write(f"    - [{ts_str}] {msg}\n")
-        f.write("\n" + "=" * 70 + "\n\n")
-
-
-def append_phase3_report_txt(day_candidates, date_str, filename="report_phase3_candidates.txt"):
-    with open(filename, "a", encoding="utf-8") as f:
-        f.write(f"Candidates for date: {date_str} (count: {len(day_candidates)})\n")
-        f.write("-" * 70 + "\n")
-        for i, cand in enumerate(day_candidates, 1):
-            f.write(f" Candidate #{i}:\n")
-            f.write(f"   Cluster size: {cand.get('size', 'N/A')}\n")
-            f.write(f"   Share of day's messages: {cand.get('daily_ratio_pct', 'N/A')}%\n")
-            f.write(f"   Reasons: {cand.get('reasons', [])}\n")
-            f.write(f"   Metrics: {cand.get('metrics', {})}\n")
-            f.write("   Sample messages:\n")
-            messages = cand.get('messages', [])
-            for msg_text in messages[:10]:
-                f.write(f"      - {msg_text}\n")
-            if len(messages) > 10:
-                f.write(f"      ... ({len(messages) - 10} more message(s))\n")
-            f.write("\n")
-        f.write("=" * 70 + "\n\n")
-
-
-def append_phase4_report_csv(day_verified_events, date_str, filename="report_phase4_verified_events.csv"):
-    
-    file_is_empty = (not os.path.exists(filename)) or os.path.getsize(filename) == 0
-    with open(filename, "a", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        if file_is_empty:
-            writer.writerow([
-                "date_shamsi", "event_index", "cluster_size", "daily_ratio_pct",
-                "title", "summary", "confidence", "sample_messages"
-            ])
-        for i, event in enumerate(day_verified_events, 1):
-            messages = event.get('messages', [])
-            sample_messages = " | ".join(messages[:10])
-            if len(messages) > 10:
-                sample_messages += f" | ... ({len(messages) - 10} more message(s))"
-            writer.writerow([
-                date_str,
-                i,
-                event.get('size', 'N/A'),
-                event.get('daily_ratio_pct', 'N/A'),
-                event.get('confidence', 'N/A'),
-                event.get('event_title', 'N/A'),
-                event.get('event_summary', 'N/A'),
-                sample_messages,
-            ])
 
 
 def load_light_models(use_precomputed_phase1, classifier_path,
@@ -252,6 +175,15 @@ def parse_args():
 
     parser.add_argument("--start-date", required=True, help="Start date, inclusive (YYYY-MM-DD)")
     parser.add_argument("--end-date", required=True, help="End date, exclusive (YYYY-MM-DD)")
+
+    parser.add_argument("--topic-id", type=int, default=None,
+                         help="Topic ID whose keywords (from the Postgres 'topic_keywords' "
+                              "table, same source sts_job_fin.py uses) will be used to filter "
+                              "fetched messages. Only takes effect when --filter-by-topic is set.")
+    parser.add_argument("--filter-by-topic", action="store_true",
+                         help="If set (together with --topic-id), only fetch messages that "
+                              "contain at least one of that topic's keywords, on top of the "
+                              "existing date-range/social-network filtering.")
 
     parser.add_argument("--location-classifier-path", default="../../models/tooka_bert_classifer/tooka_fine_funed_1",
                          help="Local path to the location NER model used by LocationExtractor")
@@ -346,16 +278,14 @@ def main():
             date_col=DATE_COL,
             start_date=args.start_date,
             end_date=args.end_date,
+            filter_by_topic=args.filter_by_topic,
+            topic_id=args.topic_id,
         )
-        #loader = DataLoader(db_name=args.db_name, table_name=args.table_name)
-        #df = loader.load_and_prepare(text_col=args.text_col, date_col=args.date_col)
-
-        # print("\n[Main] Applying date range filter...")
-        # mask_range1 = (df['date'] >= '2025-08-23') & (df['date'] < '2025-08-24 23:59:59')
-        # # mask_range2 = (df['date'] > '2025-08-24') & (df['date'] <= '2025-08-25 23:59:59')
-        # # df = df[mask_range1 | mask_range2].copy()
-        # df = df[mask_range1].copy()
-        # print(f"[Main] Rows remaining after filter: {len(df)}")
+        if df.empty:
+            print("\n[Main] WARNING: No data found for the specified parameters. Exiting gracefully.")
+            return
+        sample_size = min(10000, len(df))
+       
 
         grouped_data = df.groupby(pd.Grouper(key='date', freq='1D'))
 
@@ -384,7 +314,6 @@ def main():
             torch.cuda.empty_cache()
         gc.collect()
 
-    all_daily_results_for_json = []
     all_final_candidates = []
     all_verified_events = []
 
@@ -424,10 +353,14 @@ def main():
         ZERO_VECTOR = [0.0] * EMBEDDING_DIM
 
         # ---- Phase 1: classification (or load from the precomputed report) ----
+        valid_sentiments = []
+        valid_emotions = []
         if USE_PRECOMPUTED_PHASE1:
             print(f"[Main] Phase 1 SKIPPED (loaded from '{PHASE1_REPORT_PATH}') | "
                   f"{raw_count} raw -> {len(valid_clean_msgs)} kept, {filtered_count} filtered out")
         else:
+            raw_sentiments = group['sentiment'].tolist()
+            raw_emotions = group['emotion_label'].tolist()
             raw_messages = group['txtContent'].tolist()
             raw_timestamps = group['date'].tolist()
 
@@ -436,12 +369,8 @@ def main():
             )
             valid_clean_msgs = [item["clean_text"] for item in results if item["passed_filter"]]
             valid_timestamps = [item["timestamp"] for item in results if item["passed_filter"]]
-
-            append_phase1_report_txt({
-                "date": date, "raw_count": raw_count, "filtered_count": filtered_count,
-                "valid_clean_msgs": valid_clean_msgs, "valid_timestamps": valid_timestamps
-            })
-
+            valid_sentiments = [raw_sentiments[i] for i, item in enumerate(results) if item["passed_filter"]]
+            valid_emotions = [raw_emotions[i] for i, item in enumerate(results) if item["passed_filter"]]
             phase1_elapsed = time.time() - day_start
             print(f"[Main] Phase 1 (classification) done in {phase1_elapsed:.2f}s | "
                   f"{raw_count} raw -> {len(valid_clean_msgs)} kept, {filtered_count} filtered out")
@@ -488,15 +417,15 @@ def main():
             "valid_texts": valid_clean_msgs,
             "valid_timestamps": valid_timestamps,
             "embeddings": embeddings_array,
+            "valid_sentiments": valid_sentiments,
+            "valid_emotions": valid_emotions,   
             "communities": valid_clusters,
         }
-        append_phase2_report_txt(daily_full_data)
 
         # ---- Phase 3: candidate extraction ----
         phase3_start = time.time()
         day_candidates = extractor.process_daily_results([daily_full_data])
         all_final_candidates.extend(day_candidates)
-        append_phase3_report_txt(day_candidates, j_date)
         results_writer.save_candidate_clusters(day_candidates, execution_time=date)
         phase3_elapsed = time.time() - phase3_start
         print(f"[Main] Phase 3 (candidate extraction) done in {phase3_elapsed:.2f}s | "
@@ -543,7 +472,6 @@ def main():
                       f"Continuing with the next day.")
                 phase4_ran = False  # verification didn't actually complete - don't mark rejects
         all_verified_events.extend(day_verified_events)
-        append_phase4_report_csv(day_verified_events, j_date)
         results_writer.save_detected_events(
             day_candidates, day_verified_events, execution_time=date,
             verification_attempted=phase4_ran
@@ -561,7 +489,7 @@ def main():
         # for this day now that phases 3-4 are done using it.
         light_day_data = {k: v for k, v in daily_full_data.items() if k != 'embeddings'}
         light_day_data['embeddings'] = "not retained in clusters.json (used transiently in phase 2/3)"
-        all_daily_results_for_json.append(light_day_data)
+        
 
         del embeddings, embeddings_array, daily_full_data
         gc.collect()
@@ -588,15 +516,7 @@ def main():
     # -------------------------------------
     print(f"\n[Main] Saving final output files at {now_str()}...")
 
-    with open("clusters.json", "w", encoding="utf-8") as f:
-        json.dump(all_daily_results_for_json, f, ensure_ascii=False, indent=4, default=str)
-
-    with open("db_candidates_output.json", "w", encoding="utf-8") as f:
-        json.dump(all_final_candidates, f, ensure_ascii=False, indent=4, default=str)
-
-    with open("db_verified_events_output.json", "w", encoding="utf-8") as f:
-        json.dump(all_verified_events, f, ensure_ascii=False, indent=4, default=str)
-
+    
     results_writer.close()
 
     total_elapsed = time.time() - script_start

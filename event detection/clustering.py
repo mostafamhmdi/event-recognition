@@ -23,8 +23,8 @@ class SocialMediaEpsilonClustering:
         whole N x N matrix, we compute it in row-blocks of size B, where
         B is chosen so that one B x N block stays under this budget. Each
         block is thresholded and discarded immediately. This produces the
-        exact same edges/weights as computing the full matrix at once —
-        it's the same formula, just computed in pieces — so clustering
+        exact same edges/weights as computing the full matrix at once â€”
+        it's the same formula, just computed in pieces â€” so clustering
         results are unaffected; only peak memory changes.
         """
         self.threshold = threshold
@@ -112,7 +112,7 @@ class SocialMediaEpsilonClustering:
         `embeddings`.
         """
         t_start = time.time()
-        print(f"[Clustering] fit_predict STARTED — {len(embeddings)} embeddings, "
+        print(f"[Clustering] fit_predict STARTED â€” {len(embeddings)} embeddings, "
               f"threshold={self.threshold}")
 
         n_nodes, i_idx, j_idx, weights = self._build_edges(embeddings)

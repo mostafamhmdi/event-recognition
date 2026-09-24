@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 from sklearn.metrics.pairwise import cosine_similarity
-# ایمپورت مدل امبدینگ دقیقاً طبق ساختار شما
 from utils import similarity_model
 from preprocessing import dynamic_preprocess, PreprocessingOptions
 

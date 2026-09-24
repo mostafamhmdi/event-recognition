@@ -1,0 +1,13 @@
+{
+  "platforms": {
+    "telegram": {
+      "next_date_jalali": "1404-06-20",
+      "last_success_at": "2026-09-14T15:48:32.513537"
+    },
+    "twitter": {
+      "next_date_jalali": "1404-05-01",
+      "last_success_at": null
+    }
+  },
+  "next_run_at": null
+}

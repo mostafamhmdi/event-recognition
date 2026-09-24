@@ -1,8 +1,9 @@
-# # python3 main.py --db-name "x" --table-name "tweets_2" --start-date "1404-10-01" --end-date "1404-10-10"
-# # Twitter/X (Jalali dates, shdate column):
-# # python3 main.py --db-name "x" --table-name "tweets_2" --start-date "1404-10-01" --end-date "1404-10-10"
-# # Telegram:
-# # python3 main.py --db-name "telegram" --table-name "posts" --start-date "2024-01-01" --end-date "2024-01-10"
+# # # python3 main.py --db-name "x" --table-name "tweets_2" --start-date "1404-10-01" --end-date "1404-10-10"
+# # # Twitter/X (Jalali dates, shdate column):
+# # # python3 main.py --db-name "x" --table-name "tweets_2" --start-date "1404-10-01" --end-date "1404-10-10"
+# # # Telegram (Jalali dates, shdate column):
+# # # python3 main.py --db-name "telegram" --table-name "posts" --start-date "1404-10-01" --end-date "1404-10-10"
+
 
 
 
@@ -13,11 +14,13 @@ from typing import Optional
 
 import pandas as pd
 from clickhouse_connect import get_client
+import pg8000
 
 
 class DataLoader:
     # db_name values that should be treated as "Twitter/X"
-    TWITTER_DB_NAMES = {"x", "twitter"}
+    # updated db names to work with shdate
+    TWITTER_DB_NAMES = {"x", "twitter", "telegram", "eita", "rubika", "bale"}
 
     # Jalali dates validation (YYYY-MM-DD)
     JALALI_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -43,6 +46,39 @@ class DataLoader:
             password=os.getenv("CH_PASS", 'l@b@fi@1234')
         )
 
+    @staticmethod
+    def _get_pg_conn():
+        """Connection to the Postgres DB that holds 'topics' / 'topic_keywords'
+        (same DB/credentials sts_job_fin.py uses)."""
+        return pg8000.connect(
+            host=os.getenv("PG_HOST", '172.20.70.191'),
+            port=int(os.getenv("PG_PORT", 5432)),
+            database=os.getenv("PG_DB", 'olap'),
+            user=os.getenv("PG_USER", 'labafi'),
+            password=os.getenv("PG_PASS", 'l@b@fi@1234')
+        )
+
+    @classmethod
+    def _fetch_topic_keywords(cls, topic_id: int) -> list:
+        """Looks up the keyword list for a given topic_id from Postgres
+        (same 'topic_keywords' table sts_job_fin.py reads from)."""
+        conn = cls._get_pg_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT keyword FROM topic_keywords WHERE topic_id = %s", (topic_id,))
+            return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ch_array_str(strings: list) -> str:
+        """Formats a Python list of strings as a ClickHouse Array(String)
+        literal (same escaping sts_job_fin.py uses)."""
+        if not strings:
+            return "[]"
+        escaped = [s.replace("'", "\\'") for s in strings]
+        return "[" + ",".join(f"'{s}'" for s in escaped) + "]"
+
     @classmethod
     def _validate_jalali_date(cls, date_str: str) -> None:
         if not cls.JALALI_DATE_RE.match(date_str):
@@ -51,62 +87,117 @@ class DataLoader:
                 f"(e.g. '1404-10-01')."
             )
 
+    @staticmethod
+    def _shamsi_to_gregorian(shdate_str: str) -> Optional[str]:
+        try:
+            import jdatetime
+            y, m, d = map(int, shdate_str.split('-'))
+            return jdatetime.date(y, m, d).togregorian().strftime('%Y-%m-%d')
+        except ImportError:
+            print("[DataLoader] WARNING: 'jdatetime' is missing. Gregorian fallback aborted.")
+            return None
+        except (ValueError, TypeError) as e:
+            # Defensive: an invalid/unparseable Jalali date string should
+            # skip the Gregorian fallback for THIS date, not blow up the
+            # whole load_and_prepare() call (and with it, the whole day/run).
+            print(f"[DataLoader] WARNING: could not convert {shdate_str!r} to Gregorian ({e}). "
+                  f"Gregorian fallback aborted for this date.")
+            return None
+
     def load_and_prepare(
         self,
         text_col: Optional[str] = None,
         date_col: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        filter_by_topic: bool = False,
+        topic_id: Optional[int] = None,
     ) -> pd.DataFrame:
-        
-        # ????? ??? ??????? ?? ???? ???????
-        if self.is_twitter:
-            text_col = text_col or 'txtContent'
-            date_col = date_col or 'shdate'
-        else:
-            text_col = text_col or 'txtContent'
-            date_col = date_col or 'date'
+
+        # ??? ????? ?? (Twitter, Telegram, ...) ?????? ????? ?? ???? shdate ? ???? ????? ??????
+        text_col = text_col or 'txtContent'
+        current_date_col = date_col or 'shdate'
+
+        # ---------------------------------------------------------
+        # Optional topic-keyword condition (same idea as sts_job_fin.py:
+        # fetch_topics_map + multiSearchAny). This only ADDS a keyword
+        # condition on top of whatever date range is already requested -
+        # the existing date-range / social-network (db_name) logic below
+        # is untouched.
+        # ---------------------------------------------------------
+        keyword_condition_sql = None
+        if filter_by_topic:
+            if topic_id is None:
+                print("[DataLoader] WARNING: filter_by_topic=True but no topic_id was given. "
+                      "Skipping keyword filter.")
+            else:
+                keywords = self._fetch_topic_keywords(topic_id)
+                if keywords:
+                    kws_sql = self._ch_array_str(keywords)
+                    keyword_condition_sql = f'multiSearchAny("{text_col}", {kws_sql})'
+                    print(f"[DataLoader] Topic keyword filter ENABLED | topic_id={topic_id} | "
+                          f"{len(keywords)} keyword(s)")
+                else:
+                    print(f"[DataLoader] WARNING: no keywords found in Postgres for "
+                          f"topic_id={topic_id}. Skipping keyword filter.")
+
+        client = None
 
         try:
-            db_kind = "x" if self.is_twitter else "telegram"
+            db_kind = "x" if self.is_twitter else "insta"
             print(f"[DataLoader] Connecting to ClickHouse | database: {self.db_name} ({db_kind}) | table: {self.table_name}")
             t0 = time.time()
 
             # Open the connection
             client = self._get_ch_client()
 
-            # Build the query
+            # ---------------------------------------------------------
+            # Phase 1: query using shdate (Jalali string, e.g. '1404-10-01')
+            # ---------------------------------------------------------
             query = f"SELECT * FROM {self.table_name}"
             conditions = []
-            parameters = {}
 
-            if self.is_twitter:
-                # ???? ?????? ?????? ?? ???? ????? ???? ??????? ?? ???? ????? ??? ???? (FixedString) ??? ?????
-                if start_date:
-                    self._validate_jalali_date(start_date)
-                    conditions.append(f'"{date_col}" >= \'{start_date}\'')
-                if end_date:
-                    self._validate_jalali_date(end_date)
-                    conditions.append(f'"{date_col}" < \'{end_date}\'')
-            else:
-                # ???? ?????? ?????? ??? ?? ???? ??? ?? ??????? ?? parameters
-                if start_date:
-                    conditions.append(f'toDate("{date_col}") >= {{start_date:Date}}')
-                    parameters['start_date'] = start_date
-                if end_date:
-                    conditions.append(f'toDate("{date_col}") < {{end_date:Date}}')
-                    parameters['end_date'] = end_date
+            if start_date:
+                self._validate_jalali_date(start_date)
+                conditions.append(f'"{current_date_col}" >= \'{start_date}\'')
+            if end_date:
+                self._validate_jalali_date(end_date)
+                conditions.append(f'"{current_date_col}" < \'{end_date}\'')
+            if keyword_condition_sql:
+                conditions.append(keyword_condition_sql)
 
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
 
-            print(f"[DataLoader] Running query: {query} | params: {parameters}")
-            
-            # ????? ????? ?????? ??? ?????? ???? ????
-            df = client.query_df(query, parameters=parameters) if parameters else client.query_df(query)
+            print(f"[DataLoader] Running Phase 1 (shdate): {query}")
+            df = client.query_df(query)
 
-            # Close the connection
-            client.close()
+            # ---------------------------------------------------------
+            # Phase 2: if nothing was found on shdate, convert the Jalali
+            # range to Gregorian and retry against the 'date' column
+            # ---------------------------------------------------------
+            if df.empty and (start_date or end_date):
+                print(f"[DataLoader] No records found using '{current_date_col}'. Trying Phase 2 (Gregorian fallback on 'date').")
+                g_start = self._shamsi_to_gregorian(start_date) if start_date else None
+                g_end = self._shamsi_to_gregorian(end_date) if end_date else None
+
+                if g_start or g_end:
+                    fallback_query = f"SELECT * FROM {self.table_name}"
+                    fallback_conds = []
+
+                    if g_start:
+                        fallback_conds.append(f'toDate("date") >= \'{g_start}\'')
+                    if g_end:
+                        fallback_conds.append(f'toDate("date") < \'{g_end}\'')
+                    if keyword_condition_sql:
+                        fallback_conds.append(keyword_condition_sql)
+
+                    if fallback_conds:
+                        fallback_query += " WHERE " + " AND ".join(fallback_conds)
+
+                    print(f"[DataLoader] Running Phase 2 (date): {fallback_query}")
+                    df = client.query_df(fallback_query)
+                    current_date_col = 'date'
 
             elapsed = time.time() - t0
             print(f"[DataLoader] Query finished in {elapsed:.2f}s | rows fetched: {len(df)}")
@@ -116,27 +207,27 @@ class DataLoader:
                 return df
 
             # Check that the expected columns exist in the returned DataFrame
-            if text_col in df.columns and date_col in df.columns:
+            if text_col in df.columns and current_date_col in df.columns:
                 before = len(df)
 
                 # Drop rows with no text or no date
-                df = df.dropna(subset=[text_col, date_col])
+                df = df.dropna(subset=[text_col, current_date_col])
 
-                if self.is_twitter:
+                if current_date_col == 'shdate':
                     # ??? ???? ???? ???? FixedString ????????? ?? ????? ??????
-                    df[date_col] = df[date_col].apply(
+                    df[current_date_col] = df[current_date_col].apply(
                         lambda v: v.decode('utf-8') if isinstance(v, (bytes, bytearray)) else v
                     ).astype(str).str.strip()
-                    df = df.sort_values(by=date_col)
                 else:
                     # ?????? ??? ?? ????
-                    df[date_col] = pd.to_datetime(df[date_col])
-                    df = df.sort_values(by=date_col)
+                    df[current_date_col] = pd.to_datetime(df[current_date_col])
+
+                df = df.sort_values(by=current_date_col)
 
                 print(f"[DataLoader] Dropped {before - len(df)} row(s) with missing text/date. "
-                      f"{len(df)} valid row(s) remain, sorted by '{date_col}'.")
+                      f"{len(df)} valid row(s) remain, sorted by '{current_date_col}'.")
             else:
-                print(f"[DataLoader] WARNING: column '{text_col}' or '{date_col}' was not found in the table. "
+                print(f"[DataLoader] WARNING: column '{text_col}' or '{current_date_col}' was not found in the table. "
                       f"Skipped the dropna/sort preparation step.")
 
             return df
@@ -144,3 +235,7 @@ class DataLoader:
         except Exception as e:
             print(f"[DataLoader] ERROR while loading data from the database: {e}")
             raise
+
+        finally:
+            if client:
+                client.close()
